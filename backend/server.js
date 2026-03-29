@@ -42,82 +42,91 @@ app.post('/run-tests', async (req, res) => {
   let passedCount = 0;
   let failedCount = 0;
 
-  for (const test of testCases) {
-    let attempt = 0;
-    const maxRetries = 2;
-    let delay = 500;
-    
-    let currentActualStatus;
-    let currentActualResponse;
-    let currentResponseTime;
-    let testPassed = false;
-
-    while (attempt <= maxRetries && !testPassed) {
-      if (attempt > 0) {
-        // exponential backoff
-        await new Promise(resolve => setTimeout(resolve, delay));
-        delay *= 2;
-      }
+  const MAX_CONCURRENT = 5;
+  for (let i = 0; i < testCases.length; i += MAX_CONCURRENT) {
+    const chunk = testCases.slice(i, i + MAX_CONCURRENT);
+    const chunkResults = await Promise.all(chunk.map(async (test) => {
+      let attempt = 0;
+      const maxRetries = 2;
+      let delay = 300;
       
-      const startTime = Date.now();
-      try {
-        const response = await axios({
-          url,
-          method,
-          data: method !== 'GET' ? test.input : undefined,
-          params: method === 'GET' ? test.input : undefined,
-          validateStatus: () => true // Resolve all promises regardless of status code
-        });
+      let currentActualStatus;
+      let currentActualResponse;
+      let currentResponseTime;
+      let testPassed = false;
+
+      while (attempt <= maxRetries && !testPassed) {
+        if (attempt > 0) {
+          await new Promise(resolve => setTimeout(resolve, delay));
+          delay = Math.floor(delay * 1.5);
+        }
         
-        currentResponseTime = Date.now() - startTime;
-        currentActualStatus = response.status;
-        currentActualResponse = response.data;
-      } catch (error) {
-        currentResponseTime = Date.now() - startTime;
-        currentActualStatus = error.response ? error.response.status : 500;
-        currentActualResponse = error.message;
+        const startTime = Date.now();
+        try {
+          const response = await axios({
+            url,
+            method,
+            data: method !== 'GET' ? test.input : undefined,
+            params: method === 'GET' ? test.input : undefined,
+            validateStatus: () => true,
+            timeout: 10000
+          });
+          
+          currentResponseTime = Date.now() - startTime;
+          currentActualStatus = response.status;
+          currentActualResponse = response.data;
+        } catch (error) {
+          currentResponseTime = Date.now() - startTime;
+          currentActualStatus = error.response ? error.response.status : 503;
+          currentActualResponse = error.message;
+        }
+
+        if (currentActualStatus === test.expectedStatus) {
+          testPassed = true;
+        } else if (currentActualStatus >= 500 || currentActualStatus === 429) {
+          attempt++;
+        } else {
+          attempt++;
+        }
       }
 
-      if (currentActualStatus === test.expectedStatus) {
-        testPassed = true;
-      } else {
-        attempt++;
+      const testStatus = testPassed ? 'PASS' : 'FAIL_AFTER_RETRY';
+      let aiExplanation = null;
+      let aiFixSuggestion = null;
+
+      if (!testPassed) {
+        const aiResponse = await explainFailure(
+          url, 
+          method, 
+          test.input, 
+          test.expectedStatus, 
+          currentActualStatus, 
+          currentActualResponse
+        );
+        aiExplanation = aiResponse.explanation;
+        aiFixSuggestion = aiResponse.fixSuggestion;
       }
+
+      return {
+        name: test.name,
+        input: test.input,
+        expectedStatus: test.expectedStatus,
+        actualStatus: currentActualStatus,
+        status: testStatus,
+        responseTime: currentResponseTime,
+        retryCount: attempt > 0 && testPassed ? attempt : (attempt > maxRetries ? maxRetries : attempt),
+        requestBody: test.input,
+        responseBody: currentActualResponse,
+        aiExplanation,
+        aiFixSuggestion
+      };
+    }));
+
+    for (const res of chunkResults) {
+      if (res.status === 'PASS') passedCount++;
+      else failedCount++;
+      results.push(res);
     }
-
-    const testStatus = testPassed ? 'PASS' : 'FAIL_AFTER_RETRY';
-    let aiExplanation = null;
-    let aiFixSuggestion = null;
-
-    if (!testPassed) {
-      failedCount++;
-      const aiResponse = await explainFailure(
-        url, 
-        method, 
-        test.input, 
-        test.expectedStatus, 
-        currentActualStatus, 
-        currentActualResponse
-      );
-      aiExplanation = aiResponse.explanation;
-      aiFixSuggestion = aiResponse.fixSuggestion;
-    } else {
-      passedCount++;
-    }
-
-    results.push({
-      name: test.name,
-      input: test.input,
-      expectedStatus: test.expectedStatus,
-      actualStatus: currentActualStatus,
-      status: testStatus,
-      responseTime: currentResponseTime,
-      retryCount: attempt > 0 && testPassed ? attempt : (attempt > maxRetries ? maxRetries : attempt),
-      requestBody: test.input,
-      responseBody: currentActualResponse,
-      aiExplanation,
-      aiFixSuggestion
-    });
   }
 
   const overallStatus = failedCount === 0 ? 'PASS' : 'FAIL';
